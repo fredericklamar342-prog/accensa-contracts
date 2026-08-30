@@ -2,34 +2,60 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{storage::Persistent as _, Address as _, Events, Ledger},
+    testutils::{storage::Persistent as _, Address as _, Ledger},
     token::{StellarAssetClient, TokenClient},
     vec, Address, Env, Val,
 };
 
 const FLOAT: i128 = 1_000_000;
 
-#[test]
-fn test_domain_separator_differs_per_instance() {
+fn setup(window: u32) -> (Env, RefundVaultClient<'static>, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
+
     let merchant = Address::generate(&env);
     let token_admin = Address::generate(&env);
     let sac = env.register_stellar_asset_contract_v2(token_admin);
     let token = sac.address();
     StellarAssetClient::new(&env, &token).mint(&merchant, &FLOAT);
 
-    let id_a = env.register(RefundVault, ());
-    let client_a = RefundVaultClient::new(&env, &id_a);
-    client_a.initialize(&merchant, &token, &100);
+    let contract_id = env.register(RefundVault, ());
+    let client = RefundVaultClient::new(&env, &contract_id);
+    client.initialize(&merchant, &token, &window);
 
-    let id_b = env.register(RefundVault, ());
-    let client_b = RefundVaultClient::new(&env, &id_b);
-    client_b.initialize(&merchant, &token, &100);
+    (env, client, merchant, token)
+}
 
-    assert_ne!(
-        client_a.get_domain_separator(),
-        client_b.get_domain_separator()
+#[test]
+fn test_double_initialize_fails() {
+    let (_env, client, merchant, token) = setup(100);
+    assert_eq!(
+        client.try_initialize(&merchant, &token, &100),
+        Err(Ok(Error::AlreadyInitialized))
+    );
+}
+
+#[test]
+fn test_deposit_moves_tokens_into_vault() {
+    let (env, client, merchant, token) = setup(100);
+    client.deposit(&merchant, &600_000);
+
+    let token_client = TokenClient::new(&env, &token);
+    assert_eq!(token_client.balance(&client.address), 600_000);
+    assert_eq!(token_client.balance(&merchant), FLOAT - 600_000);
+}
+
+/// Deposits are deliberately merchant-only (see docs/SECURITY_MODEL.md): the
+/// vault only ever holds the merchant's own funds, so a third party cannot
+/// contribute float — dust or otherwise — that the merchant has not authorised.
+/// This test pins that guarantee so it cannot be relaxed by accident.
+#[test]
+fn test_deposit_from_non_merchant_fails() {
+    let (env, client, _merchant, _token) = setup(100);
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        client.try_deposit(&stranger, &100),
+        Err(Ok(Error::Unauthorized))
     );
 }
 
@@ -93,7 +119,7 @@ fn test_refund_outside_window_fails() {
 }
 
 #[test]
-fn test_nonce_increments_on_refund() {
+fn test_refund_at_window_boundary_succeeds() {
     let (env, client, merchant, _token) = setup(100);
     client.deposit(&merchant, &500_000);
 
@@ -200,17 +226,29 @@ fn test_refund_exceeding_float_fails() {
 }
 
 #[test]
-fn test_nonce_increments_on_withdraw() {
-    let (_env, client, merchant, _token) = setup(100);
+fn test_withdraw_returns_float_to_merchant() {
+    let (env, client, merchant, token) = setup(100);
     client.deposit(&merchant, &500_000);
-    let nonce_before = client.get_nonce();
-    client.withdraw(&100_000, &merchant);
-    assert_eq!(client.get_nonce(), nonce_before + 1);
+    client.withdraw(&200_000, &merchant);
+
+    let token_client = TokenClient::new(&env, &token);
+    assert_eq!(token_client.balance(&client.address), 300_000);
+    assert_eq!(token_client.balance(&merchant), FLOAT - 300_000);
 }
 
 #[test]
-fn test_nonce_does_not_increment_on_failed_operation() {
+fn test_withdraw_exceeding_float_fails() {
     let (_env, client, merchant, _token) = setup(100);
+    client.deposit(&merchant, &100);
+    assert_eq!(
+        client.try_withdraw(&10_000, &merchant),
+        Err(Ok(Error::InsufficientFloat))
+    );
+}
+
+#[test]
+fn test_set_refund_window_takes_effect() {
+    let (env, client, merchant, _token) = setup(100);
     client.deposit(&merchant, &500_000);
 
     env.ledger().with_mut(|li| li.sequence_number = 500);
@@ -234,14 +272,7 @@ fn test_nonce_does_not_increment_on_failed_operation() {
     client.execute_policy();
 
     // paid_at=17_780, window=1000, current=17_780 → still inside the window.
-    client.refund(
-        &payment_ref,
-        &buyer,
-        &100,
-        &(env.ledger().sequence()),
-        &100,
-        &None,
-    );
+    client.refund(&payment_ref, &buyer, &100, &(env.ledger().sequence()), &100);
     assert!(client.get_refund(&payment_ref).is_some());
 }
 
@@ -274,7 +305,8 @@ fn test_uninitialized_calls_fail() {
 }
 
 #[test]
-fn test_nonce_is_strictly_monotonic() {
+#[should_panic]
+fn test_refund_requires_merchant_auth() {
     let (env, client, merchant, _token) = setup(100);
     client.deposit(&merchant, &500_000);
 
@@ -399,16 +431,20 @@ fn contract_outcome<T>(
     }
 }
 
-    client.deposit(&merchant, &100_000);
-    seen_nonces.push(client.get_nonce());
+/// One state-changing operation of the vault's public surface.
+struct PausedSurfaceOp<'a> {
+    name: &'static str,
+    invoke: &'a dyn Fn() -> Result<(), Error>,
+}
 
-    client.withdraw(&50_000, &merchant);
-    seen_nonces.push(client.get_nonce());
+#[test]
+fn test_paused_state_blocks_and_preserves_every_operation() {
+    let (env, client, merchant, token) = setup(100);
+    client.deposit(&merchant, &600_000);
+    let token_client = TokenClient::new(&env, &token);
 
-    let payment_ref = BytesN::from_array(&env, &[0xBBu8; 32]);
+    let payment_ref = BytesN::from_array(&env, &[0x80u8; 32]);
     let buyer = Address::generate(&env);
-    client.refund(&payment_ref, &buyer, &10_000, &0, &10_000);
-    seen_nonces.push(client.get_nonce());
 
     // Every IsPaused-gated operation, with arguments that would succeed while
     // the vault is unpaused.
@@ -480,9 +516,19 @@ fn contract_outcome<T>(
             op.name
         );
         assert!(
-            window[1] > window[0],
-            "nonce must be strictly monotonic: got {:?}",
-            seen_nonces
+            client.get_refund(&payment_ref).is_none(),
+            "{} created a refund record while paused",
+            op.name
+        );
+        assert_eq!(
+            info.deployed_principal, yield_info_before.deployed_principal,
+            "{} mutated deployed principal while paused",
+            op.name
+        );
+        assert_eq!(
+            info.harvested_yield, yield_info_before.harvested_yield,
+            "{} mutated harvested yield while paused",
+            op.name
         );
     }
 
@@ -566,7 +612,12 @@ fn test_events_emitted() {
             (
                 client.address.clone(),
                 (Symbol::new(&env, "deposit_event"), merchant.clone()).into_val(&env),
-                soroban_sdk::map![&env, (Symbol::new(&env, "amount"), 500_000i128)].into_val(&env)
+                soroban_sdk::map![
+                    &env,
+                    (Symbol::new(&env, "amount"), 500_000i128),
+                    (Symbol::new(&env, "nonce"), 0u64)
+                ]
+                .into_val(&env)
             )
         ]
     );
@@ -600,6 +651,10 @@ fn test_events_emitted() {
         Symbol::new(&env, "ledger").into_val(&env),
         env.ledger().sequence().into_val(&env),
     );
+    refund_data.set(
+        Symbol::new(&env, "nonce").into_val(&env),
+        1u64.into_val(&env),
+    );
     assert_eq!(
         refund_events,
         vec![
@@ -621,7 +676,12 @@ fn test_events_emitted() {
             (
                 client.address.clone(),
                 (Symbol::new(&env, "withdraw_event"), merchant.clone()).into_val(&env),
-                soroban_sdk::map![&env, (Symbol::new(&env, "amount"), 100_000i128)].into_val(&env)
+                soroban_sdk::map![
+                    &env,
+                    (Symbol::new(&env, "amount"), 100_000i128),
+                    (Symbol::new(&env, "nonce"), 2u64)
+                ]
+                .into_val(&env)
             )
         ]
     );
@@ -1232,14 +1292,7 @@ fn test_refund_before_deadline_succeeds() {
     let payment_ref = BytesN::from_array(&env, &[0x20u8; 32]);
     let buyer = Address::generate(&env);
     env.ledger().with_mut(|li| li.timestamp = deadline - 1);
-    client.refund(
-        &payment_ref,
-        &buyer,
-        &100,
-        &env.ledger().sequence(),
-        &100,
-        &None,
-    );
+    client.refund(&payment_ref, &buyer, &100, &env.ledger().sequence(), &100);
     assert!(client.get_refund(&payment_ref).is_some());
 }
 
@@ -1253,14 +1306,7 @@ fn test_refund_at_deadline_boundary_succeeds() {
     let payment_ref = BytesN::from_array(&env, &[0x21u8; 32]);
     let buyer = Address::generate(&env);
     env.ledger().with_mut(|li| li.timestamp = deadline);
-    client.refund(
-        &payment_ref,
-        &buyer,
-        &100,
-        &env.ledger().sequence(),
-        &100,
-        &None,
-    );
+    client.refund(&payment_ref, &buyer, &100, &env.ledger().sequence(), &100);
     assert!(client.get_refund(&payment_ref).is_some());
 }
 
@@ -1275,14 +1321,7 @@ fn test_refund_after_deadline_fails() {
     let buyer = Address::generate(&env);
     env.ledger().with_mut(|li| li.timestamp = deadline + 1);
     assert_eq!(
-        client.try_refund(
-            &payment_ref,
-            &buyer,
-            &100,
-            &env.ledger().sequence(),
-            &100,
-            &None
-        ),
+        client.try_refund(&payment_ref, &buyer, &100, &env.ledger().sequence(), &100),
         Err(Ok(Error::RefundExpired))
     );
     assert!(
@@ -1308,14 +1347,7 @@ fn test_deadline_and_window_are_independent_bounds() {
     // WindowExpired.
     env.ledger().with_mut(|li| li.timestamp = deadline + 1);
     assert_eq!(
-        client.try_refund(
-            &payment_ref,
-            &buyer,
-            &100,
-            &env.ledger().sequence(),
-            &100,
-            &None
-        ),
+        client.try_refund(&payment_ref, &buyer, &100, &env.ledger().sequence(), &100),
         Err(Ok(Error::RefundExpired))
     );
     assert!(client.get_refund(&payment_ref).is_none());
@@ -1330,14 +1362,7 @@ fn test_zero_deadline_disables_expiry() {
     env.ledger().with_mut(|li| li.timestamp = u64::MAX / 2);
     let payment_ref = BytesN::from_array(&env, &[0x24u8; 32]);
     let buyer = Address::generate(&env);
-    client.refund(
-        &payment_ref,
-        &buyer,
-        &100,
-        &env.ledger().sequence(),
-        &100,
-        &None,
-    );
+    client.refund(&payment_ref, &buyer, &100, &env.ledger().sequence(), &100);
     assert!(client.get_refund(&payment_ref).is_some());
 }
 
@@ -1828,7 +1853,6 @@ fn test_shared_refund_vectors_match_typescript_sdk() {
             &v.amount,
             &v.paid_at_ledger,
             &v.amount,
-            &None,
         );
 
         assert_eq!(
@@ -1862,6 +1886,7 @@ fn test_shared_refund_vectors_include_live_testnet_refund() {
 #[test]
 fn test_refund_to_contract_address_fails_self_transfer() {
     use soroban_sdk::testutils::Events;
+
     let (env, client, merchant, _token) = setup(100);
     client.deposit(&merchant, &500_000);
 
@@ -1882,52 +1907,10 @@ fn test_refund_to_contract_address_fails_self_transfer() {
     assert_eq!(events.events().len(), 0);
 }
 
-/// The batch path must reject items targeting the vault itself (fail closed,
-/// skipped with `false`) instead of consuming the payment_ref while leaving
-/// float untouched — the self-transfer threat in SECURITY_MODEL §Threats.
-#[test]
-fn test_process_batch_item_to_contract_address_skipped() {
-    let (env, client, merchant, token) = setup(100);
-    let per_refund = 10_000i128;
-    client.deposit(&merchant, &(2 * per_refund));
-
-    let mut params = batch_params(&env, 2, per_refund);
-    let vault_addr = client.address.clone();
-    // Point the second item at the vault itself.
-    params.set(
-        1,
-        RefundParam {
-            payment_ref: params.get(1).unwrap().payment_ref,
-            recipient: vault_addr,
-            amount: per_refund,
-            paid_at_ledger: 0,
-            payment_amount: per_refund,
-        },
-    );
-
-    env.cost_estimate()
-        .budget()
-        .reset_limits(2_000_000_000, 2_000_000_000);
-    let res = client.process_batch(&params);
-
-    // First item refunded, second skipped (self-transfer), no panic.
-    assert_eq!(res, vec![&env, true, false]);
-    assert!(client
-        .get_refund(&params.get(0).unwrap().payment_ref)
-        .is_some());
-    assert!(client
-        .get_refund(&params.get(1).unwrap().payment_ref)
-        .is_none());
-    // Float intact except the one legit payout.
-    assert_eq!(
-        TokenClient::new(&env, &token).balance(&client.address),
-        per_refund
-    );
-}
-
 #[test]
 fn test_withdraw_to_contract_address_fails_self_transfer() {
     use soroban_sdk::testutils::Events;
+
     let (env, client, merchant, _token) = setup(100);
     client.deposit(&merchant, &500_000);
 
@@ -2027,7 +2010,6 @@ fn make_claim(
         amount,
         paid_at_ledger,
         payment_amount,
-        vdf_proof: None,
     }
 }
 
@@ -2041,6 +2023,7 @@ fn expect_refund_event(
     fee: i128,
     cumulative_refunded: i128,
     recipient: &Address,
+    nonce: u64,
 ) -> (soroban_sdk::Address, Vec<Val>, Val) {
     use soroban_sdk::{IntoVal, Map, Symbol};
 
@@ -2062,6 +2045,7 @@ fn expect_refund_event(
         Symbol::new(env, "ledger").into_val(env),
         env.ledger().sequence().into_val(env),
     );
+    data.set(Symbol::new(env, "nonce").into_val(env), nonce.into_val(env));
 
     (
         client.address.clone(),
@@ -2136,9 +2120,9 @@ fn test_claim_batch_emits_one_event_per_item() {
         env.events().all().filter_by_contract(&client.address),
         vec![
             &env,
-            expect_refund_event(&env, &client, &ref1, 100_000, 0, 100_000, &b1),
-            expect_refund_event(&env, &client, &ref2, 50_000, 0, 50_000, &b2),
-            expect_refund_event(&env, &client, &ref3, 250_000, 0, 250_000, &b3),
+            expect_refund_event(&env, &client, &ref1, 100_000, 0, 100_000, &b1, 1),
+            expect_refund_event(&env, &client, &ref2, 50_000, 0, 50_000, &b2, 2),
+            expect_refund_event(&env, &client, &ref3, 250_000, 0, 250_000, &b3, 3),
         ]
     );
 }
@@ -2405,5 +2389,165 @@ fn test_claim_batch_cost_stays_within_budget() {
     assert!(
         batch_cpu < single_cpu * 12,
         "batch cpu {batch_cpu} (single {single_cpu}) exceeds 12x single"
+    );
+}
+
+// ── Domain separator + nonce monotonicity tests (issue #136) ────────────
+
+#[test]
+fn test_domain_separator_differs_per_instance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(token_admin);
+    let token = sac.address();
+    StellarAssetClient::new(&env, &token).mint(&merchant, &FLOAT);
+
+    let id_a = env.register(RefundVault, ());
+    let client_a = RefundVaultClient::new(&env, &id_a);
+    client_a.initialize(&merchant, &token, &100);
+
+    let id_b = env.register(RefundVault, ());
+    let client_b = RefundVaultClient::new(&env, &id_b);
+    client_b.initialize(&merchant, &token, &100);
+
+    assert_ne!(
+        client_a.get_domain_separator(),
+        client_b.get_domain_separator()
+    );
+}
+
+#[test]
+fn test_nonce_increments_on_refund() {
+    let (env, client, merchant, _token) = setup(100);
+    client.deposit(&merchant, &500_000);
+
+    let nonce_before = client.get_nonce();
+
+    let payment_ref = BytesN::from_array(&env, &[2u8; 32]);
+    let buyer = Address::generate(&env);
+    client.refund(&payment_ref, &buyer, &100, &0, &100, &None);
+    assert!(client.get_refund(&payment_ref).is_some());
+
+    assert_eq!(client.get_nonce(), nonce_before + 1);
+}
+
+#[test]
+fn test_nonce_increments_on_withdraw() {
+    let (_env, client, merchant, _token) = setup(100);
+    client.deposit(&merchant, &500_000);
+    let nonce_before = client.get_nonce();
+    client.withdraw(&100_000, &merchant);
+    assert_eq!(client.get_nonce(), nonce_before + 1);
+}
+
+#[test]
+fn test_nonce_does_not_increment_on_failed_operation() {
+    let (env, client, merchant, _token) = setup(100);
+    client.deposit(&merchant, &500_000);
+
+    let nonce_before = client.get_nonce();
+
+    env.ledger().with_mut(|li| li.sequence_number = 500);
+
+    let payment_ref = BytesN::from_array(&env, &[5u8; 32]);
+    let buyer = Address::generate(&env);
+    assert_eq!(
+        client.try_refund(&payment_ref, &buyer, &100, &100, &100, &None),
+        Err(Ok(Error::WindowExpired))
+    );
+
+    // Nonce must not have changed after the failed refund.
+    assert_eq!(client.get_nonce(), nonce_before);
+}
+
+#[test]
+fn test_nonce_is_strictly_monotonic() {
+    let (env, client, merchant, _token) = setup(100);
+    client.deposit(&merchant, &600_000);
+
+    let mut seen_nonces = vec![&env];
+
+    seen_nonces.push_back(client.get_nonce());
+    client.deposit(&merchant, &100_000);
+    seen_nonces.push_back(client.get_nonce());
+
+    client.withdraw(&50_000, &merchant);
+    seen_nonces.push_back(client.get_nonce());
+
+    let payment_ref = BytesN::from_array(&env, &[0xBBu8; 32]);
+    let buyer = Address::generate(&env);
+    client.refund(&payment_ref, &buyer, &10_000, &0, &10_000, &None);
+    seen_nonces.push_back(client.get_nonce());
+
+    // Every nonce must be strictly greater than the previous one.
+    assert!(seen_nonces.len() >= 3);
+    for w in seen_nonces.windows(2) {
+        assert!(
+            w[1] > w[0],
+            "nonce must be strictly monotonic: got {:?}",
+            seen_nonces
+        );
+    }
+}
+
+// ── Helper for batch tests ──────────────────────────────────────────────
+
+fn batch_params(env: &Env, count: usize, per_refund: i128) -> soroban_sdk::Vec<RefundParam> {
+    let mut params = soroban_sdk::vec![&env];
+    for i in 0..count {
+        let mut ref_bytes = [0u8; 32];
+        ref_bytes[0] = i as u8;
+        params.push_back(RefundParam {
+            payment_ref: BytesN::from_array(env, &ref_bytes),
+            recipient: Address::generate(env),
+            amount: per_refund,
+            paid_at_ledger: 0,
+            payment_amount: per_refund,
+            vdf_proof: None,
+        });
+    }
+    params
+}
+
+/// The batch path must reject items targeting the vault itself (fail closed,
+/// skipped with `false`) instead of consuming the payment_ref while leaving
+/// float untouched — the self-transfer threat in SECURITY_MODEL §Threats.
+#[test]
+fn test_process_batch_item_to_contract_address_skipped() {
+    let (env, client, merchant, token) = setup(100);
+    let per_refund = 10_000i128;
+    client.deposit(&merchant, &(2 * per_refund));
+
+    let mut params = batch_params(&env, 2, per_refund);
+    let vault_addr = client.address.clone();
+    // Point the second item at the vault itself.
+    params.set(
+        1,
+        RefundParam {
+            payment_ref: params.get(1).unwrap().payment_ref,
+            recipient: vault_addr,
+            amount: per_refund,
+            paid_at_ledger: 0,
+            payment_amount: per_refund,
+            vdf_proof: None,
+        },
+    );
+
+    let res = client.process_batch(&params);
+
+    // First item refunded, second skipped (self-transfer), no panic.
+    assert_eq!(res, vec![&env, true, false]);
+    assert!(client
+        .get_refund(&params.get(0).unwrap().payment_ref)
+        .is_some());
+    assert!(client
+        .get_refund(&params.get(1).unwrap().payment_ref)
+        .is_none());
+    // Float intact except the one legit payout.
+    assert_eq!(
+        TokenClient::new(&env, &token).balance(&client.address),
+        per_refund
     );
 }
