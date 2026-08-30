@@ -104,6 +104,12 @@
               "args": [
                 {
                   "u32": 20000
+                },
+                {
+                  "u64": "0"
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -150,7 +156,8 @@
                 },
                 {
                   "i128": "100"
-                }
+                },
+                "void"
               ]
             }
           },
@@ -377,7 +384,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 21675
+        "live_until": 535980
       },
       {
         "entry": {
@@ -410,6 +417,30 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "ReentrancyLock"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bool": false
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "RefundDeadline"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": "0"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "RefundWindow"
                           }
                         ]
@@ -422,12 +453,36 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "StorageVersion"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "Token"
                           }
                         ]
                       },
                       "val": {
                         "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "VdfDelay"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 0
                       }
                     }
                   ]
