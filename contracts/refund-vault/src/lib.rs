@@ -847,44 +847,8 @@ impl RefundVault {
         if env
             .storage()
             .instance()
-            .get(&DataKey::RefundWindow)
-            .unwrap();
-        if window > 0 {
-            let current_ledger = env.ledger().sequence();
-            if current_ledger > paid_at_ledger + window {
-                return Err(Error::WindowExpired);
-            }
-        }
-
-        // Dynamic oracle policy: when configured, refunds are only processed
-        // while the aggregated external feed satisfies the condition (e.g.
-        // the asset price is below the SLA threshold). Fails closed on a
-        // missing whitelist or all-stale data rather than guessing. This runs
-        // inside the reentrancy lock acquired by `refund`, so a whitelisted
-        // oracle cannot re-enter the vault from its `get_price` callback.
-        let oracle_policy: Option<oracle::OraclePolicy> =
-            env.storage().instance().get(&DataKey::OraclePolicy);
-        if let Some(policy) = oracle_policy {
-            if !oracle::evaluate_policy(env, &policy)? {
-                return Err(Error::OraclePolicyDenied);
-            }
-        }
-
-        // Ceiling check: cumulative refunds must not exceed the original amount.
-        // The ceiling is read from the (re)stored record, freshly minted on the
-        // first partial for this payment.
-        let existing: Option<RefundRecord> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::RefundV2(payment_ref.clone()));
-        let (previous_refunded, record_ceiling) = match existing {
-            Some(rec) => (rec.amount_refunded, rec.payment_amount),
-            None => (0i128, payment_amount),
-        };
-
-        if previous_refunded.checked_add(amount).is_none()
-            || record_ceiling <= 0
-            || previous_refunded + amount > record_ceiling
+            .get(&DataKey::IsPaused)
+            .unwrap_or(false)
         {
             return Err(Error::Paused);
         }
@@ -892,23 +856,14 @@ impl RefundVault {
         let merchant: Address = env
             .storage()
             .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
-        let extend_to = refund_record_ttl_extend_to(env, window, paid_at_ledger);
-        // Threshold == extend_to (not TTL_THRESHOLD): see
-        // `refund_record_ttl_extend_to` for why a small fixed threshold makes
-        // this a no-op on a freshly-written entry.
-        env.storage().persistent().extend_ttl(
-            &DataKey::RefundV2(payment_ref.clone()),
-            extend_to,
-            extend_to,
-        );
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        merchant.require_auth();
 
         for claim in claims.iter() {
             claim_single(&env, &claim)?;
         }
-        .publish(env);
-
-        release_reentrancy_lock(env);
+        release_reentrancy_lock(&env);
         Ok(())
     }
 
@@ -1152,6 +1107,23 @@ impl RefundVault {
             .ok_or(Error::NotInitialized)?;
         merchant.require_auth();
 
+        let mut oracles: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Oracles)
+            .unwrap_or_else(|| Vec::new(&env));
+        if oracles.contains(&oracle) {
+            return Err(Error::OracleAlreadyAdded);
+        }
+        oracles.push_back(oracle);
+        env.storage().instance().set(&DataKey::Oracles, &oracles);
+
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        Ok(())
+    }
+
     /// Returns the persisted storage layout version. Legacy deployments that
     /// predate this marker are treated as version 1.
     pub fn get_storage_version(env: Env) -> Result<u32, Error> {
@@ -1216,18 +1188,8 @@ impl RefundVault {
     pub fn get_token(env: Env) -> Result<Address, Error> {
         env.storage()
             .instance()
-            .get(&DataKey::Oracles)
-            .unwrap_or_else(|| Vec::new(&env));
-        if oracles.contains(&oracle) {
-            return Err(Error::OracleAlreadyAdded);
-        }
-        oracles.push_back(oracle);
-        env.storage().instance().set(&DataKey::Oracles, &oracles);
-
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
-        Ok(())
+            .get(&DataKey::Token)
+            .ok_or(Error::NotInitialized)
     }
 
     /// Remove an oracle from the whitelist. Only callable by the merchant.

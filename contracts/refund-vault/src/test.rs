@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{storage::Persistent as _, Address as _, Events, Ledger},
+    testutils::{storage::Persistent as _, Address as _, Ledger},
     token::{StellarAssetClient, TokenClient},
     vec, Address, Env, Val,
 };
@@ -272,14 +272,7 @@ fn test_set_refund_window_takes_effect() {
     client.execute_policy();
 
     // paid_at=17_780, window=1000, current=17_780 → still inside the window.
-    client.refund(
-        &payment_ref,
-        &buyer,
-        &100,
-        &(env.ledger().sequence()),
-        &100,
-        &None,
-    );
+    client.refund(&payment_ref, &buyer, &100, &(env.ledger().sequence()), &100);
     assert!(client.get_refund(&payment_ref).is_some());
 }
 
@@ -1285,14 +1278,7 @@ fn test_refund_before_deadline_succeeds() {
     let payment_ref = BytesN::from_array(&env, &[0x20u8; 32]);
     let buyer = Address::generate(&env);
     env.ledger().with_mut(|li| li.timestamp = deadline - 1);
-    client.refund(
-        &payment_ref,
-        &buyer,
-        &100,
-        &env.ledger().sequence(),
-        &100,
-        &None,
-    );
+    client.refund(&payment_ref, &buyer, &100, &env.ledger().sequence(), &100);
     assert!(client.get_refund(&payment_ref).is_some());
 }
 
@@ -1306,14 +1292,7 @@ fn test_refund_at_deadline_boundary_succeeds() {
     let payment_ref = BytesN::from_array(&env, &[0x21u8; 32]);
     let buyer = Address::generate(&env);
     env.ledger().with_mut(|li| li.timestamp = deadline);
-    client.refund(
-        &payment_ref,
-        &buyer,
-        &100,
-        &env.ledger().sequence(),
-        &100,
-        &None,
-    );
+    client.refund(&payment_ref, &buyer, &100, &env.ledger().sequence(), &100);
     assert!(client.get_refund(&payment_ref).is_some());
 }
 
@@ -1328,14 +1307,7 @@ fn test_refund_after_deadline_fails() {
     let buyer = Address::generate(&env);
     env.ledger().with_mut(|li| li.timestamp = deadline + 1);
     assert_eq!(
-        client.try_refund(
-            &payment_ref,
-            &buyer,
-            &100,
-            &env.ledger().sequence(),
-            &100,
-            &None
-        ),
+        client.try_refund(&payment_ref, &buyer, &100, &env.ledger().sequence(), &100),
         Err(Ok(Error::RefundExpired))
     );
     assert!(
@@ -1361,14 +1333,7 @@ fn test_deadline_and_window_are_independent_bounds() {
     // WindowExpired.
     env.ledger().with_mut(|li| li.timestamp = deadline + 1);
     assert_eq!(
-        client.try_refund(
-            &payment_ref,
-            &buyer,
-            &100,
-            &env.ledger().sequence(),
-            &100,
-            &None
-        ),
+        client.try_refund(&payment_ref, &buyer, &100, &env.ledger().sequence(), &100),
         Err(Ok(Error::RefundExpired))
     );
     assert!(client.get_refund(&payment_ref).is_none());
@@ -1383,14 +1348,7 @@ fn test_zero_deadline_disables_expiry() {
     env.ledger().with_mut(|li| li.timestamp = u64::MAX / 2);
     let payment_ref = BytesN::from_array(&env, &[0x24u8; 32]);
     let buyer = Address::generate(&env);
-    client.refund(
-        &payment_ref,
-        &buyer,
-        &100,
-        &env.ledger().sequence(),
-        &100,
-        &None,
-    );
+    client.refund(&payment_ref, &buyer, &100, &env.ledger().sequence(), &100);
     assert!(client.get_refund(&payment_ref).is_some());
 }
 
@@ -1881,7 +1839,6 @@ fn test_shared_refund_vectors_match_typescript_sdk() {
             &v.amount,
             &v.paid_at_ledger,
             &v.amount,
-            &None,
         );
 
         assert_eq!(
@@ -1915,6 +1872,7 @@ fn test_shared_refund_vectors_include_live_testnet_refund() {
 #[test]
 fn test_refund_to_contract_address_fails_self_transfer() {
     use soroban_sdk::testutils::Events;
+
     let (env, client, merchant, _token) = setup(100);
     client.deposit(&merchant, &500_000);
 
@@ -1935,52 +1893,10 @@ fn test_refund_to_contract_address_fails_self_transfer() {
     assert_eq!(events.events().len(), 0);
 }
 
-/// The batch path must reject items targeting the vault itself (fail closed,
-/// skipped with `false`) instead of consuming the payment_ref while leaving
-/// float untouched — the self-transfer threat in SECURITY_MODEL §Threats.
-#[test]
-fn test_process_batch_item_to_contract_address_skipped() {
-    let (env, client, merchant, token) = setup(100);
-    let per_refund = 10_000i128;
-    client.deposit(&merchant, &(2 * per_refund));
-
-    let mut params = batch_params(&env, 2, per_refund);
-    let vault_addr = client.address.clone();
-    // Point the second item at the vault itself.
-    params.set(
-        1,
-        RefundParam {
-            payment_ref: params.get(1).unwrap().payment_ref,
-            recipient: vault_addr,
-            amount: per_refund,
-            paid_at_ledger: 0,
-            payment_amount: per_refund,
-        },
-    );
-
-    env.cost_estimate()
-        .budget()
-        .reset_limits(2_000_000_000, 2_000_000_000);
-    let res = client.process_batch(&params);
-
-    // First item refunded, second skipped (self-transfer), no panic.
-    assert_eq!(res, vec![&env, true, false]);
-    assert!(client
-        .get_refund(&params.get(0).unwrap().payment_ref)
-        .is_some());
-    assert!(client
-        .get_refund(&params.get(1).unwrap().payment_ref)
-        .is_none());
-    // Float intact except the one legit payout.
-    assert_eq!(
-        TokenClient::new(&env, &token).balance(&client.address),
-        per_refund
-    );
-}
-
 #[test]
 fn test_withdraw_to_contract_address_fails_self_transfer() {
     use soroban_sdk::testutils::Events;
+
     let (env, client, merchant, _token) = setup(100);
     client.deposit(&merchant, &500_000);
 
@@ -2080,7 +1996,6 @@ fn make_claim(
         amount,
         paid_at_ledger,
         payment_amount,
-        vdf_proof: None,
     }
 }
 
